@@ -1,0 +1,11 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# clasp (Apps Script CLI) — local credentials, keep out of git
+.clasprc.json
+.clasp.json
+
+# Editor
+.vscode/
+.idea/
