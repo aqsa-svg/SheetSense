@@ -1,5 +1,11 @@
 # SheetSense
 
+**Type `=SENTIMENT(A2)` into a spreadsheet cell and drag it down a thousand rows — AI as a formula, with no add-on to install and nothing to pay for.**
+
+<!-- SCREENSHOT: a sheet with =SENTIMENT and =CLASSIFY filled down a column.
+     Replace with: ![SheetSense in a sheet](docs/screenshot-sheet.png) -->
+> 📸 *Screenshot placeholder — a column of `=SENTIMENT()` and `=CLASSIFY()` results filled down beside raw text.*
+
 AI functions for Google Sheets, powered by the **Gemini API** (Google AI Studio,
 free tier). Use them like native formulas and fill them down a column:
 
@@ -19,6 +25,33 @@ cell — they come back as a readable string starting with `⚠ `.
 > not run locally.
 
 ---
+
+## The problem
+
+Getting an LLM to touch spreadsheet data normally means exporting to CSV, writing a script, and pasting results back — or installing a paid marketplace add-on that wants access to all your files. Neither works for the actual use case, which is "I have 800 rows of feedback and I want a sentiment column."
+
+The awkward part is that Google Sheets recalculates custom functions aggressively and in bulk. Fill a formula down 1,000 rows and you have issued 1,000 API calls, and free-tier Gemini will rate-limit you long before the column finishes. **So the interesting engineering here isn't the prompt — it's not burning your quota.**
+
+## Results
+
+Measured by reading the source; this is Apps Script, so it runs inside Google Sheets rather than locally.
+
+| Measured | Value |
+|---|---|
+| Custom functions exposed to cells | **5** — `SUMMARIZE`, `SENTIMENT`, `CLASSIFY`, `EXTRACT`, `ASK` |
+| Menu actions | **6** — set API key, test connection, set model, clear cache, about, onOpen |
+| Source size | **661 lines** Apps Script (V8 runtime) |
+| Default model | `gemini-2.5-flash` (switchable to `-flash-lite` / `-pro` from the menu) |
+| Temperature | `0.2` — chosen for repeatable cell values |
+| Retry policy | up to **3 attempts**, backoff 500 → 1000 → 2000 ms |
+| Retried status codes | **429, 500, 503 only** — everything else fails fast |
+| Response cache | MD5-keyed, **6 h TTL** (`CacheService` hard maximum) |
+| API calls for empty input | **0** — short-circuits before `UrlFetchApp` |
+| OAuth scopes requested | **2** — `script.external_request`, `script.container.ui` |
+
+**[TODO] Cache hit rate on a real fill-down.** The caching is the whole quota argument and its effect is unmeasured. *To measure:* fill `=SENTIMENT()` down 500 rows with ~30% duplicate text, then compare the Apps Script execution log's `UrlFetchApp` call count against 500. Report calls saved.
+
+**[TODO] Median latency per cell**, and how many rows can be filled before free-tier rate limiting kicks in.
 
 ## Setup
 
@@ -133,3 +166,33 @@ The manifest requests only the two scopes these features need:
 ---
 
 Built by **Aqsa Siddiqui**.
+
+## Design decisions and tradeoffs
+
+**Cache first, because Sheets recalculates without asking.** Successful responses are cached under an MD5 of `(function, model, prompt)` for six hours — `CacheService`'s hard ceiling. A sheet that recalculates on open, or a column with repeated text, costs one API call per *distinct* input rather than one per cell. The tradeoff is that a cached cell won't reflect a model or prompt change for up to six hours, which is why "Clear cache" exists as a menu item.
+
+**Clearing the cache bumps a version counter instead of deleting keys.** `CacheService` has no bulk-clear, so `CACHE_VERSION` is part of every cache key and incrementing it orphans every existing entry at once. Cheap and instant; the cost is that the stale entries sit there until their TTL expires rather than being freed.
+
+**Empty input never reaches the API.** Filling a formula down a column always overshoots into blank rows. Short-circuiting empty input to `""` before `UrlFetchApp` means a 1,000-row fill over 800 rows of data costs 800 calls, not 1,000. Small decision, direct quota saving.
+
+**Retry only on 429/500/503, fail fast on everything else.** Transient limits and server errors are worth a bounded retry with exponential backoff; a 400 or a 403 is a bad request or a bad key and retrying it just burns the 30-second cell budget three times over. `MAX_ATTEMPTS = 3` is set by that budget, not by optimism.
+
+**Errors return a readable string, never an exception.** A thrown error in a custom function poisons the cell with `#ERROR!` and tells the user nothing. Returning `⚠ <reason>` keeps the sheet intact and diagnosable. The tradeoff: `ISERROR()` won't catch it, because as far as Sheets is concerned the cell succeeded.
+
+**Temperature 0.2, not 0.** Cell values should be stable across recalculation, so temperature is low — but not zero, which in practice gives no meaningful additional determinism and can make short outputs degenerate.
+
+**AI Studio API key, not Vertex AI.** Vertex would mean service accounts and a GCP project. An AI Studio key pasted into Script Properties keeps setup to two menu clicks on the free tier. The cost is no IAM, no per-user auth, and one shared key per sheet.
+
+**The key lives in Script Properties, never in a cell.** A key in a cell is visible to every viewer, travels with a copy of the sheet, and lands in version history.
+
+## Known limitations
+
+- **Quota is shared and unmetered.** One API key serves the whole sheet, and there's no per-user or per-day accounting. A large fill-down by one editor can rate-limit everyone.
+- **Cache hit rate and latency are unmeasured.** See the `[TODO]`s above — the central efficiency claim has no numbers behind it.
+- **Cached values can be up to 6 hours stale**, including after a model change, until the cache is cleared from the menu.
+- **Errors are invisible to spreadsheet error handling.** `⚠ …` is a normal string, so `IFERROR`/`ISERROR` won't trap it.
+- **A 30-second per-cell ceiling** is imposed by Apps Script, which is what caps retries at 3. Very long inputs can time out.
+- **Anyone who can edit the sheet can read the API key** via the Apps Script editor. Script Properties keeps it out of cells, not out of the project.
+- **`CLASSIFY` output is coerced to your label list**, so a genuinely ambiguous input still returns one of the labels rather than admitting uncertainty.
+- **No tests.** Apps Script has no local test harness here, and nothing is verified automatically.
+- **Not deployable as a shareable add-on.** This is source to paste into one spreadsheet's script project, not a published Workspace Marketplace add-on.
